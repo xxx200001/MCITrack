@@ -82,30 +82,6 @@ class MCITRACK(BaseTracker):
             self.memory_bank = self.cfg.TEST.MB.DEFAULT
         print("Update threshold is: ", self.memory_bank)
 
-        # === 方向 C: 一致性模块配置 ===
-        # P0 (默认 False): consistency 仅诊断输出, 不影响任何决策
-        # P1 (True): 仅用于 h_state reset, 不影响模板更新/淘汰
-        self.use_consistency_for_h_reset = getattr(
-            self.cfg.TEST, 'USE_CONSISTENCY_FOR_H_RESET', False)
-        self.consistency_reset_alpha = getattr(
-            self.cfg.TEST, 'CONSISTENCY_RESET_ALPHA', 0.5)
-        print("Use consistency for h_reset: ", self.use_consistency_for_h_reset)
-        print("Consistency reset alpha: ", self.consistency_reset_alpha)
-
-        # [修复 ②] consistency 在线标定: 用序列内 EMA 均值/方差做 z-score + sigmoid，
-        # 把 consistency 映射到与 conf_score 可比的 (0,1) 尺度后再线性混合。
-        self.consistency_calib_momentum = getattr(
-            self.cfg.TEST, 'CONSISTENCY_CALIB_MOMENTUM', 0.95)
-        self._cons_ema_mean = None
-        self._cons_ema_var = None
-
-        # === 诊断日志开关 (默认关; 开启后每个序列写一个 CSV, 不影响跟踪结果) ===
-        self.log_diagnostics = getattr(self.cfg.TEST, 'LOG_DIAGNOSTICS', False)
-        self.diag_dir = getattr(self.cfg.TEST, 'DIAG_DIR', './diag_logs')
-        self.seq_idx = -1
-        self.diag_file = None
-        print("Log diagnostics: ", self.log_diagnostics, "-> dir:", self.diag_dir)
-
     def initialize(self, image, info: dict):
         if self.debug == 2:
             self.save_path = os.path.join(self.save_dir, info['seq_name'])
@@ -134,63 +110,6 @@ class MCITRACK(BaseTracker):
         self.frame_id = 0
         self.memory_template_list = self.template_list.copy()
         self.memory_template_anno_list = self.template_anno_list.copy()
-
-        # [修复 ②] 每个序列独立重置一致性在线标定统计
-        self._cons_ema_mean = None
-        self._cons_ema_var = None
-        self._frames_since_h_reset = 0  # 距上次 h_state 重置的帧数 (记忆"年龄")
-
-        # === 诊断日志: 每个序列一个 CSV, 写表头 ===
-        if self.log_diagnostics:
-            self.seq_idx += 1
-            seq_name = info.get('seq_name', None) if isinstance(info, dict) else None
-            seq_name = seq_name if seq_name else ("seq_%04d" % self.seq_idx)
-            safe = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in str(seq_name))
-            os.makedirs(self.diag_dir, exist_ok=True)
-            self.diag_file = os.path.join(self.diag_dir, safe + ".csv")
-            with open(self.diag_file, "w", newline="") as f:
-                csv.writer(f).writerow([
-                    "frame_id", "conf_score", "consistency", "calibrated_consistency",
-                    "combined_score", "apce", "v_per_template",
-                    "h_reset_by_conf", "h_reset_by_combined", "final_h_reset", "h_age",
-                    "memory_added", "clip_refreshed", "memory_len", "num_template",
-                    "x", "y", "w", "h"])
-
-    def _calibrate_consistency(self, c):
-        """
-        [修复 ②] 序列内在线 z-score + sigmoid 标定，输出 ∈ (0,1)，与 conf_score 同尺度。
-        含义: 本帧一致性相对该序列 "典型水平" 是偏高还是偏低。
-        首帧无统计 -> 返回中性 0.5。用更新前的统计量算 z，再更新 EMA (避免自我抵消)。
-        """
-        m = self.consistency_calib_momentum
-        if self._cons_ema_mean is None:
-            self._cons_ema_mean = c
-            self._cons_ema_var = 1e-4
-            return 0.5
-        std = max(math.sqrt(self._cons_ema_var) if self._cons_ema_var > 1e-8 else 1e-3, 1e-3)
-        z = (c - self._cons_ema_mean) / std
-        delta = c - self._cons_ema_mean
-        self._cons_ema_mean = m * self._cons_ema_mean + (1.0 - m) * c
-        self._cons_ema_var = m * self._cons_ema_var + (1.0 - m) * (delta * delta)
-        return 1.0 / (1.0 + math.exp(-z))
-
-    def _log_frame(self, conf, cons, cal_cons, combined, apce, v_per_template,
-                   h_conf, h_comb, h_final, h_age, mem_added, clip_refreshed):
-        """[诊断] 把本帧关键量追加写入序列 CSV。日志失败绝不影响跟踪。"""
-        try:
-            x, y, w, h = self.state
-            v_str = ";".join("%.4f" % v for v in (v_per_template or []))
-            with open(self.diag_file, "a", newline="") as f:
-                csv.writer(f).writerow([
-                    self.frame_id, "%.4f" % conf, "%.4f" % cons, "%.4f" % cal_cons,
-                    "%.4f" % combined, "%.4f" % apce, v_str,
-                    int(bool(h_conf)), int(bool(h_comb)), int(bool(h_final)), int(h_age),
-                    int(bool(mem_added)), int(bool(clip_refreshed)),
-                    len(self.memory_template_list), self.num_template,
-                    round(float(x), 2), round(float(y), 2),
-                    round(float(w), 2), round(float(h), 2)])
-        except Exception:
-            pass
 
     def _text_input_process(self, nlp, seq_length):
         text_ids, text_masks = self._extract_token_from_nlp(nlp, seq_length)
@@ -249,16 +168,6 @@ class MCITRACK(BaseTracker):
         with torch.no_grad():
             enc_opt = self.network.forward_encoder(self.template_list, search_list, self.template_anno_list)
 
-        # === S1 fix: 在 Neck 之前计算一致性分数 ===
-        # enc_opt 中的模板 tokens 尚未被 Neck 的 ViT self-attention 混合
-        # Token 顺序: [search(L_x) | template_0(L_z) | ... | template_{N-1}(L_z)]
-        with torch.no_grad():
-            search_feat_raw = enc_opt[:, 0:self.network.num_patch_x]  # (B, L_x, D)
-            V_scores = self.network.forward_consistency(enc_opt, search_feat_raw)  # (B, N)
-            avg_consistency = V_scores.mean().item()  # 诊断用，不用于门控
-            v_per_template = (V_scores.detach().squeeze(0).cpu().tolist()
-                              if self.log_diagnostics else None)  # 每个模板的可靠度
-
         # run the time neck
         with torch.no_grad():
             hidden_state = self.h_state.copy()
@@ -281,13 +190,6 @@ class MCITRACK(BaseTracker):
         else:
             response = pred_score_map
 
-        # [诊断] APCE: 响应图锐度, 经典的独立可靠度指标 (与 conf/consistency 对照用)
-        apce = 0.0
-        if self.log_diagnostics:
-            with torch.no_grad():
-                _r = response.detach().reshape(-1).float()
-                _fmin = _r.min(); _fmax = _r.max()
-                apce = ((_fmax - _fmin) ** 2 / (((_r - _fmin) ** 2).mean() + 1e-8)).item()
         if 'size_map' in out_dict.keys():
             pred_boxes, conf_score = self.network.decoder.cal_bbox(response, out_dict['size_map'],
                                                                    out_dict['offset_map'], return_score=True)
@@ -301,44 +203,14 @@ class MCITRACK(BaseTracker):
         # get the final box result
         self.state = clip_box(self.map_box_back(pred_box, resize_factor), H, W, margin=10)
 
-        # ====================================================================
-        # h_state 重置逻辑 (P0 / P1 双路径)
-        # --------------------------------------------------------------------
-        # P0 (USE_CONSISTENCY_FOR_H_RESET=False, 默认):
-        #   仅用 conf_score 触发, 与 baseline 完全一致
-        #   consistency 仅在 return dict 中输出, 不影响 tracking
-        # P1 (USE_CONSISTENCY_FOR_H_RESET=True):
-        #   用 alpha*conf + (1-alpha)*consistency 联合触发 h_state reset
-        #   仅改变 h_state reset 一个决策点, 用于隔离 ablation
-        #   不影响模板更新、模板淘汰、bbox 预测等其他决策
-        # ====================================================================
         conf_score_val = conf_score.item() if hasattr(conf_score, 'item') else float(conf_score)
-        alpha = self.consistency_reset_alpha
-        # [修复 ②] 先把 consistency 标定到与 conf 可比的 (0,1) 尺度, 再线性混合
-        calibrated_consistency = self._calibrate_consistency(avg_consistency)
-        combined_score = alpha * conf_score_val + (1.0 - alpha) * calibrated_consistency
 
-        # 计算诊断标志 (无论开关状态, 都计算用于 return dict 分析)
-        h_reset_by_conf = conf_score_val < self.update_h_t
-        h_reset_by_combined = combined_score < self.update_h_t
-
+        # h_state 重置 (baseline: 仅 conf_score 触发)
         self.h_state = h
-        if self.use_consistency_for_h_reset:
-            # P1: combined_score 触发 reset
-            final_h_reset = h_reset_by_combined
-        else:
-            # P0/baseline: 仅 conf_score 触发 reset
-            final_h_reset = h_reset_by_conf
-
-        if final_h_reset:
+        if conf_score_val < self.update_h_t:
             self.h_state = [None] * self.cfg.MODEL.NECK.N_LAYERS
-            self._frames_since_h_reset = 0
-        else:
-            self._frames_since_h_reset += 1
 
-        # === 模板更新: 仅用 conf_score 门控 (baseline, P0/P1 均不变) ===
-        # consistency 不参与模板更新决策
-        memory_added = False
+        # === 模板更新: 仅用 conf_score 门控 (baseline) ===
         if self.num_template > 1:
             if (conf_score > self.update_threshold):
                 z_patch_arr, resize_factor = sample_target(image, self.state, self.params.template_factor,
@@ -352,12 +224,10 @@ class MCITRACK(BaseTracker):
                                                             [self.params.template_size, self.params.template_size]),
                                                         normalize=True)
                 self.memory_template_anno_list.append(prev_box_crop.to(template.device).unsqueeze(0))
-                memory_added = True
-                # === FIFO 淘汰 (baseline, P0/P1 均不变) ===
+                # === FIFO 淘汰 (baseline) ===
                 if len(self.memory_template_list) > self.memory_bank:
                     self.memory_template_list.pop(0)
                     self.memory_template_anno_list.pop(0)
-        clip_refreshed = False
         if (self.frame_id % self.update_intervals == 0):
             assert len(self.memory_template_anno_list) == len(self.memory_template_list)
             len_list = len(self.memory_template_anno_list)
@@ -370,15 +240,7 @@ class MCITRACK(BaseTracker):
                 self.template_list.pop(1)
                 self.template_anno_list.append(self.memory_template_anno_list[idx])
                 self.template_anno_list.pop(1)
-            clip_refreshed = True
         assert len(self.template_list) == self.num_template
-
-        # === 诊断日志: 记录本帧 conf / consistency / 模板替换等 ===
-        if self.log_diagnostics and self.diag_file is not None:
-            self._log_frame(conf_score_val, avg_consistency, calibrated_consistency,
-                            combined_score, apce, v_per_template,
-                            h_reset_by_conf, h_reset_by_combined, final_h_reset,
-                            self._frames_since_h_reset, memory_added, clip_refreshed)
 
         # for debug
         if self.debug == 2:
@@ -395,16 +257,7 @@ class MCITRACK(BaseTracker):
             cv2.waitKey(1)
 
         return {"target_bbox": self.state,
-                "best_score": conf_score,
-                "conf_score": conf_score_val,
-                "consistency": avg_consistency,
-                "calibrated_consistency": calibrated_consistency,
-                "combined_score": combined_score,
-                "h_reset_by_conf": h_reset_by_conf,
-                "h_reset_by_combined": h_reset_by_combined,
-                "final_h_reset": final_h_reset,
-                "use_consistency_for_h_reset": self.use_consistency_for_h_reset,
-                "consistency_reset_alpha": self.consistency_reset_alpha}
+                "best_score": conf_score}
 
 
     def map_box_back(self, pred_box: list, resize_factor: float):

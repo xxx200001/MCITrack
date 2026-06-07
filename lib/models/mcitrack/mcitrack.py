@@ -13,7 +13,6 @@ from lib.utils.box_ops import box_xyxy_to_cxcywh
 from lib.utils.pos_embed import get_sinusoid_encoding_table, get_2d_sincos_pos_embed
 from .fastitpn import fastitpnl, fastitpnb
 from .neck import build_neck
-from .consistency import TemplateSearchConsistency
 from collections import OrderedDict
 from lib.utils.box_ops import box_cxcywh_to_xyxy, box_xywh_to_xyxy, box_xyxy_to_cxcywh, box_cxcywh_to_xyxy, box_iou
 from .decoder import NonParametricMiningHead, TemplateAwareFusion
@@ -54,18 +53,6 @@ class MCITrack(nn.Module):
         # self.language_backbone = text_encoder
         self.text_proj = nn.Linear(768, 512)
 
-        # === 方向 C: 一致性分数模块 (ParaHydra+ 循环一致性) ===
-        # 无可学习参数，直接在 Neck 输出特征上计算注意力
-        # 必须用 NECK.D_MODEL (与 encoder/neck 输出维度一致)
-        cons_cfg = getattr(cfg.MODEL, 'CONSISTENCY', None)
-        cons_para_factor = cons_cfg.PARA_FACTOR if cons_cfg is not None else 10.0
-        cons_topk_ratio = cons_cfg.TOPK_RATIO if cons_cfg is not None else 0.25
-        self.consistency = TemplateSearchConsistency(
-            d_model=cfg.MODEL.NECK.D_MODEL,
-            para_factor=cons_para_factor,
-            topk_ratio=cons_topk_ratio,
-        )
-
         # === TemplateAwareFusion 模块 (从 ParaHydra+ PMIFM 迁移) ===
         # ENABLE=False 时不创建模块, 与 baseline 完全一致
         self.use_fusion = cfg.MODEL.FUSION.ENABLE
@@ -96,9 +83,6 @@ class MCITrack(nn.Module):
             return self.forward_neck(enc_opt,neck_h_state)
         elif mode == "decoder":
             return self.forward_decoder(feature)
-        elif mode == "consistency":
-            # enc_opt 此处传入 neck 输出的 encoder_out (x), feature 传入 neck 输出的 xs
-            return self.forward_consistency(enc_opt, feature)
         elif mode == "fusion":
             # enc_opt = Encoder 输出 (Neck 前, 模板独立)
             # feature = Neck 输出的 xs (搜索特征, 已增强)
@@ -120,36 +104,6 @@ class MCITrack(nn.Module):
         x = self.encoder.body.fc_norm(x)
         xs = xs + x[:, 0:self.num_patch_x]
         return x,xs,h
-
-    def forward_consistency(self, encoder_out, search_feat):
-        """
-        计算每个模板与搜索区域的循环一致性分数。
-
-        Args:
-            encoder_out: (B, L_x + N*L_z, D)  Encoder 输出 (Neck 之前)，
-                         模板 tokens 尚未被 Neck ViT self-attention 混合
-            search_feat: (B, L_x, D)           从 encoder_out 中切出的搜索特征
-
-        Returns:
-            V_scores: (B, N)  每个模板的一致性分数
-        """
-        # 从全局特征中切出模板 tokens
-        template_tokens = encoder_out[:, self.num_patch_x:]  # (B, N*L_z, D)
-        B, total_tz, D = template_tokens.shape
-        assert total_tz % self.num_patch_z == 0, \
-            f"Template token count {total_tz} not divisible by num_patch_z {self.num_patch_z}"
-        N = total_tz // self.num_patch_z  # 模板数量
-
-        # 拆分为逐模板特征
-        template_list = []
-        for t in range(N):
-            start = t * self.num_patch_z
-            end = start + self.num_patch_z
-            template_list.append(template_tokens[:, start:end, :])  # (B, L_z, D)
-
-        # 计算每个模板的一致性分数
-        V_scores = self.consistency.compute_multi_template(search_feat, template_list)
-        return V_scores  # (B, N)
 
     def forward_fusion(self, enc_opt, search_feat):
         """
